@@ -93,6 +93,12 @@ func (r *Runner) process(output chan Output, wg *sync.WaitGroup) {
 
 	sendItem := func(input string) {
 		if _, ipRange, _ := net.ParseCIDR(input); ipRange != nil {
+			if r.options.AggregateCidr {
+				// Aggregate mode never enumerates addresses, so large IPv6
+				// prefixes stay processable.
+				r.processCIDRAggregate(input, output)
+				return
+			}
 			cidrInputs, err := mapcidr.IPAddressesAsStream(input)
 			if err != nil {
 				if r.options.Verbose {
@@ -141,11 +147,16 @@ func (r *Runner) waitForData(output chan Output, wg *sync.WaitGroup) {
 			r.options.OnResult(receivedData)
 		}
 
-		if r.options.Json {
+		switch {
+		case r.options.Json:
 			r.writer.WriteJSON(receivedData)
-		} else if r.options.Response && !r.options.Exclude {
+		case receivedData.aggregate && r.options.Response:
 			r.writer.WriteString(receivedData.String())
-		} else {
+		case receivedData.aggregate:
+			r.writer.WriteString(receivedData.Prefix)
+		case r.options.Response && !r.options.Exclude:
+			r.writer.WriteString(receivedData.String())
+		default:
 			r.writer.WriteString(receivedData.Input)
 		}
 	}
@@ -254,19 +265,83 @@ func (r *Runner) processInputItemSingle(item string, output chan Output) {
 		data.Waf = matched
 		data.WafName = provider
 	}
+	if r.shouldEmit(data) {
+		output <- data
+	}
+}
+
+// shouldEmit applies the provider match/filter options and the category
+// flags to a classified record. It is shared by the per-address and the
+// aggregate CIDR paths so both honor the same selection rules.
+func (r *Runner) shouldEmit(data Output) bool {
+	// Unmatched records are only emitted in exclude mode, which bypasses
+	// this helper.
+	if data.itemType == "" {
+		return false
+	}
 	if skipped := filterIP(r.options, data); skipped {
-		return
+		return false
 	}
 	if matched := matchIP(r.options, data); !matched {
-		return
+		return false
 	}
 	switch {
-	case r.options.Cdn && data.itemType == "cdn", r.options.Cloud && data.itemType == "cloud", r.options.Waf && data.itemType == "waf":
-		{
-			output <- data
+	case r.options.Cdn && data.itemType == "cdn",
+		r.options.Cloud && data.itemType == "cloud",
+		r.options.Waf && data.itemType == "waf":
+		return true
+	case !r.options.Cdn && !r.options.Waf && !r.options.Cloud:
+		return true
+	}
+	return false
+}
+
+// processCIDRAggregate classifies a CIDR input as minimal homogeneous CIDR
+// blocks without enumerating addresses and feeds the resulting records through
+// the existing category/provider filters and result callback.
+func (r *Runner) processCIDRAggregate(item string, output chan Output) {
+	blocks, err := r.cdnclient.CheckCIDR(item)
+	if err != nil {
+		if r.options.Verbose {
+			gologger.Error().Msgf("Could not classify cidr %s: %s", item, err)
 		}
-	case (!r.options.Cdn && !r.options.Waf && !r.options.Cloud) && matched:
-		{
+		return
+	}
+	for _, block := range blocks {
+		data := Output{
+			aurora:       r.aurora,
+			Timestamp:    time.Now(),
+			Input:        item,
+			IP:           block.Prefix.Addr().String(),
+			Prefix:       block.Prefix.String(),
+			AddressCount: block.AddressCount.String(),
+			aggregate:    true,
+			itemType:     block.ItemType,
+		}
+		switch block.ItemType {
+		case "cdn":
+			data.Cdn = true
+			data.CdnName = block.Provider
+		case "cloud":
+			data.Cloud = true
+			data.CloudName = block.Provider
+		case "waf":
+			data.Waf = true
+			data.WafName = block.Provider
+		}
+
+		if r.options.Exclude {
+			// Exclude mode emits the complement of the identified address
+			// space: every unmatched block of the input prefix.
+			if !block.Matched {
+				output <- data
+			}
+			continue
+		}
+		if !block.Matched {
+			continue
+		}
+		if r.shouldEmit(data) {
 			output <- data
 		}
 	}

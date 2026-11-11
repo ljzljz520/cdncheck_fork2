@@ -26,11 +26,31 @@ type Output struct {
 	CloudName string    `json:"cloud_name,omitempty"`
 	Waf       bool      `json:"waf,omitempty"`
 	WafName   string    `json:"waf_name,omitempty"`
+	// Prefix is the homogeneous CIDR block emitted in aggregate-cidr mode.
+	Prefix string `json:"prefix,omitempty"`
+	// AddressCount is the exact decimal number of addresses in Prefix.
+	// A string is used so IPv6 counts up to 2^128 stay precise.
+	AddressCount string `json:"address_count,omitempty"`
+	// aggregate marks records produced from CIDR aggregation instead of
+	// per-address enumeration.
+	aggregate bool
 	itemType  string
 }
 
 func (o *Output) String() string {
 	sw := *o.aurora
+	if o.aggregate {
+		category := o.itemType
+		if category == "" {
+			category = "unknown"
+		}
+		provider := o.ProviderName()
+		if provider == "" {
+			provider = "-"
+		}
+		return fmt.Sprintf("%s [%s] [%s] (%s addresses)", o.Prefix,
+			sw.BrightCyan(category).String(), sw.BrightYellow(provider).String(), o.AddressCount)
+	}
 	commonName := "[%s]"
 	itemType := fmt.Sprintf("[%s]", o.itemType)
 	switch o.itemType {
@@ -49,6 +69,19 @@ func (o *Output) String() string {
 }
 func (o *Output) StringIP() string {
 	return o.IP
+}
+
+// ProviderName returns the matched provider name regardless of category.
+func (o *Output) ProviderName() string {
+	switch o.itemType {
+	case "cdn":
+		return o.CdnName
+	case "cloud":
+		return o.CloudName
+	case "waf":
+		return o.WafName
+	}
+	return ""
 }
 
 type Options struct {
@@ -77,6 +110,9 @@ type Options struct {
 	OnResult           func(r Output)
 	MaxRetries         int
 	Threads            int
+	// AggregateCidr classifies CIDR inputs as minimal homogeneous CIDR
+	// blocks instead of enumerating every address. IPv6-safe.
+	AggregateCidr bool
 }
 
 // configureOutput configures the output logging levels to be displayed on the screen
@@ -114,6 +150,7 @@ func readFlags() (*Options, error) {
 
 	flagSet.CreateGroup("input", "INPUT",
 		flagSet.StringSliceVarP(&opts.Inputs, "input", "i", nil, "list of ip / dns to process", goflags.FileCommaSeparatedStringSliceOptions),
+		flagSet.BoolVarP(&opts.AggregateCidr, "aggregate-cidr", "ac", false, "split input CIDRs into minimal homogeneous CIDR blocks instead of enumerating IPs (IPv6-safe, exact address counts)"),
 	)
 
 	flagSet.CreateGroup("detection", "DETECTION",
